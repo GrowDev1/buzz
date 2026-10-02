@@ -196,6 +196,10 @@ pub struct Config {
     pub health_port: u16,
     /// TCP port for the Prometheus metrics exporter (`GET /metrics`).
     pub metrics_port: u16,
+    /// Health listener address; BUZZ_HEALTH_BIND_ADDR overrides the legacy port.
+    pub health_bind_addr: SocketAddr,
+    /// Metrics listener address; BUZZ_METRICS_BIND_ADDR overrides the legacy port.
+    pub metrics_bind_addr: SocketAddr,
     /// Interval between read-only partition catalog audits.
     pub partition_audit_interval: Duration,
     /// Whether the partition manager may create uncovered monthly partitions.
@@ -605,6 +609,11 @@ fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>
 }
 
 impl Config {
+    /// Bind the configured health endpoint used by relay startup.
+    pub async fn bind_health_listener(&self) -> std::io::Result<tokio::net::TcpListener> {
+        tokio::net::TcpListener::bind(self.health_bind_addr).await
+    }
+
     /// Loads configuration from environment variables, falling back to development defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr_raw =
@@ -907,6 +916,18 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(9102);
+
+        let listener_addr = |name: &str, port| -> Result<SocketAddr, ConfigError> {
+            match std::env::var(name) {
+                Ok(value) => value.parse().map_err(|_| {
+                    ConfigError::InvalidValue(format!("{name} must be an IP socket address"))
+                }),
+                Err(std::env::VarError::NotPresent) => Ok(([0, 0, 0, 0], port).into()),
+                Err(_) => Err(ConfigError::InvalidValue(format!("{name} must be Unicode"))),
+            }
+        };
+        let health_bind_addr = listener_addr("BUZZ_HEALTH_BIND_ADDR", health_port)?;
+        let metrics_bind_addr = listener_addr("BUZZ_METRICS_BIND_ADDR", metrics_port)?;
 
         // Catalog-only and cheap, but clamp operator mistakes away from a hot
         // loop or a multi-day observability gap.
@@ -1277,7 +1298,7 @@ impl Config {
                     Some(other) => {
                         return Err(ConfigError::InvalidValue(format!(
                             "BUZZ_ADMIN_AUTH must be \"nip98\" or \"disabled\"; got \"{other}\""
-                        )))
+                        )));
                     }
                 };
 
@@ -1355,6 +1376,8 @@ impl Config {
             uds_path,
             health_port,
             metrics_port,
+            health_bind_addr,
+            metrics_bind_addr,
             partition_audit_interval,
             partition_manager_create_enabled,
             pubkey_allowlist_enabled,

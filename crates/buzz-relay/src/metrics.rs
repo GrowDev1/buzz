@@ -286,8 +286,16 @@ impl MetricsInstallError {
 /// A later exporter exit remains detached from relay service; external scrape
 /// coverage is authoritative for exporter availability.
 pub fn try_install(port: u16, gauge_idle_timeout_secs: u64) -> Result<(), MetricsInstallError> {
+    try_install_at(([0, 0, 0, 0], port).into(), gauge_idle_timeout_secs)
+}
+
+/// Install the exporter on the selected IPv4 or IPv6 socket address.
+pub fn try_install_at(
+    addr: std::net::SocketAddr,
+    gauge_idle_timeout_secs: u64,
+) -> Result<(), MetricsInstallError> {
     let (recorder, exporter) = configured_prometheus_builder(gauge_idle_timeout_secs)
-        .with_http_listener(([0, 0, 0, 0], port))
+        .with_http_listener(addr)
         .build()
         .map_err(MetricsInstallError::Build)?;
 
