@@ -277,7 +277,7 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         );
     let (boot, ()) = boot.run_required(
         StartupPhase::MetricsBind,
-        || relay_metrics::try_install(config.metrics_port, usage_idle_timeout_secs),
+        || relay_metrics::try_install_at(config.metrics_bind_addr, usage_idle_timeout_secs),
         |error| match error.failure() {
             relay_metrics::MetricsInstallFailure::Bind => LifecycleReason::Bind,
             relay_metrics::MetricsInstallFailure::RecorderConflict => {
@@ -431,12 +431,16 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     if config.require_relay_membership {
-                        error!("Fatal: failed to ensure deployment community with membership enforcement enabled: {e}");
+                        error!(
+                            "Fatal: failed to ensure deployment community with membership enforcement enabled: {e}"
+                        );
                         return Err(anyhow::anyhow!(
                             "Failed to ensure deployment community (required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
                         ));
                     }
-                    error!("Failed to ensure deployment community (non-fatal, membership not required): {e}");
+                    error!(
+                        "Failed to ensure deployment community (non-fatal, membership not required): {e}"
+                    );
                     None
                 }
             }
@@ -478,7 +482,9 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
                     // Membership enforcement is on — a missing owner means no one
                     // can administer the relay. Fail fast rather than silently start
                     // in a broken state.
-                    error!("Fatal: failed to bootstrap relay owner with membership enforcement enabled: {e}");
+                    error!(
+                        "Fatal: failed to bootstrap relay owner with membership enforcement enabled: {e}"
+                    );
                     return Err(anyhow::anyhow!(
                         "Failed to bootstrap relay owner (required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
                     ));
@@ -1811,10 +1817,13 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
-    info!(port = config.health_port, "Health probe listener started");
+    let health_listener = config.bind_health_listener().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to bind health address {}: {e}",
+            config.health_bind_addr
+        )
+    })?;
+    info!(address = %config.health_bind_addr, "Health probe listener started");
     tokio::spawn(async move {
         axum::serve(health_listener, health_router).await.ok();
     });
