@@ -11,7 +11,7 @@ async fn claim(db: &Db, tenant: CommunityId, token: &[u8], signer: &[u8]) -> boo
     let Ok(mut tx) = db.begin_event_write_transaction(tenant).await else {
         return false;
     };
-    let won = buzz_db::workflow::claim_approval_resume(&mut tx, tenant, token, signer)
+    let won = buzz_db::workflow::claim_approval_resume(&mut tx, tenant, token, signer, None)
         .await
         .unwrap();
     tx.commit().await.unwrap();

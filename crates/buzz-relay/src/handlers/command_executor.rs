@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use nostr::Event;
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -1069,20 +1070,35 @@ async fn decide_approval(
         .get_approval_by_stored_hash(community_id, &token)
         .await
         .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
-    check_approver_spec(&approval.approver_spec, &hex::encode(signer))?;
-    if approval.approver_spec != hex::encode(signer) || approval.status != ApprovalStatus::Pending {
+    if approval.status != ApprovalStatus::Pending {
+        return Err(IngestError::Rejected(format!(
+            "invalid: approval already {}",
+            approval.status
+        )));
+    }
+    if Utc::now() > approval.expires_at {
         return Err(IngestError::Rejected(
-            "forbidden: approval is not pending for this signer".into(),
+            "invalid: approval token has expired".into(),
+        ));
+    }
+    check_approver_spec(&approval.approver_spec, &hex::encode(signer))?;
+    // The durable claim accepts only the exact designated pubkey.
+    if approval.approver_spec != hex::encode(signer) {
+        return Err(IngestError::Rejected(
+            "forbidden: not the designated approver for this request".into(),
         ));
     }
     let mut tx = match persist_command_event(&state.db, tenant, event, None).await? {
         PersistResult::Duplicate => {
-            return Err(IngestError::Rejected(
-                "invalid: approval decision replay".into(),
-            ))
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
         }
         PersistResult::Inserted(tx) => tx,
     };
+    let note = (!event.content.is_empty()).then_some(event.content.as_str());
     // Lock in the same order as the durable claim. Snapshot these rows while locked.
     buzz_db::workflow::lock_approval_for_decision(
         &mut tx,
@@ -1130,7 +1146,7 @@ async fn decide_approval(
             .check_owner_authority(community_id, channel, &workflow.owner_pubkey, &def)
             .await
             .map_err(|e| IngestError::Rejected(e.to_string()))?;
-        buzz_db::workflow::claim_approval_resume(&mut tx, community_id, &token, &signer)
+        buzz_db::workflow::claim_approval_resume(&mut tx, community_id, &token, &signer, note)
             .await
             .map_err(|e| IngestError::Internal(e.to_string()))?
     } else {
@@ -1139,15 +1155,19 @@ async fn decide_approval(
             community_id,
             &token,
             &signer,
-            &event.content,
+            note,
             run.id,
+            &format!(
+                "workflow cancelled: approval denied by {}",
+                hex::encode(signer)
+            ),
         )
         .await
         .map_err(|e| IngestError::Internal(e.to_string()))?
     };
     if !changed {
         return Err(IngestError::Rejected(
-            "invalid: approval expired or already consumed".into(),
+            "invalid: approval already acted on (race)".into(),
         ));
     }
     tx.commit()
@@ -1175,8 +1195,13 @@ async fn decide_approval(
                 ) || (after.status == RunStatus::WaitingApproval
                     && after.current_step > approval.step_index)
                 {
-                    if let Err(error) = sqlx::query("UPDATE platform_approval_resume_claims SET state='completed' WHERE community_id=$1 AND token=$2")
-                        .bind(community_id.as_uuid()).bind(&token).execute(db.pool()).await {
+                    if let Err(error) = buzz_db::workflow::complete_approval_resume_claim(
+                        db.pool(),
+                        community_id,
+                        &token,
+                    )
+                    .await
+                    {
                         tracing::error!(%run_id, %error, "approval claim remains recovery_required");
                     }
                 }

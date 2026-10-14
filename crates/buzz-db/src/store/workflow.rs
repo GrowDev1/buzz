@@ -1417,23 +1417,60 @@ pub async fn lock_approval_for_decision(
 /// Consume a pending approval once and leave a durable recovery marker.
 /// Only the winning caller may dispatch the continuation. The marker must not
 /// be retried automatically: a crash can happen after an external side effect.
+///
+/// `note` is the approver's optional note; it is stored with the granted
+/// approval by the winning caller only.
 pub async fn claim_approval_resume(
     tx: &mut AdmittedTx,
     community_id: CommunityId,
     token_hash: &[u8],
     signer: &[u8],
+    note: Option<&str>,
 ) -> Result<bool> {
-    Ok(
-        sqlx::query_scalar("SELECT platform_claim_approval($1,$2,$3)")
+    let won: bool = sqlx::query_scalar("SELECT platform_claim_approval($1,$2,$3)")
+        .bind(community_id.as_uuid())
+        .bind(token_hash)
+        .bind(signer)
+        .fetch_one(tx.conn())
+        .await?;
+    if won && note.is_some() {
+        sqlx::query("UPDATE workflow_approvals SET note=$3 WHERE community_id=$1 AND token=$2")
             .bind(community_id.as_uuid())
             .bind(token_hash)
-            .bind(signer)
-            .fetch_one(tx.conn())
-            .await?,
-    )
+            .bind(note)
+            .execute(tx.conn())
+            .await?;
+    }
+    Ok(won)
 }
 
-/// Deny a pending approval for its designated signer and cancel its run.
+/// Mark a claimed approval's continuation as finished, so the durable
+/// recovery marker no longer reports an interrupted resume.
+pub async fn complete_approval_resume_claim(
+    pool: &PgPool,
+    community_id: CommunityId,
+    token_hash: &[u8],
+) -> Result<()> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE platform_approval_resume_claims SET state='completed'
+         WHERE community_id=$1 AND token=$2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .execute(tx.conn())
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Deny a pending approval for its designated signer and cancel its run with
+/// `cancel_message`. `note` is the approver's optional note.
 /// Returns `false` when the approval is no longer pending, has expired, or
 /// belongs to another signer; nothing is changed in that case.
 pub async fn deny_approval(
@@ -1441,8 +1478,9 @@ pub async fn deny_approval(
     community_id: CommunityId,
     token_hash: &[u8],
     signer: &[u8],
-    note: &str,
+    note: Option<&str>,
     run_id: Uuid,
+    cancel_message: &str,
 ) -> Result<bool> {
     let changed = sqlx::query(
         "UPDATE workflow_approvals SET status='denied', approver_pubkey=$3, denied_at=now(), note=$4
@@ -1460,11 +1498,12 @@ pub async fn deny_approval(
     if changed {
         sqlx::query(
             "UPDATE workflow_runs SET status='cancelled', completed_at=now(),
-             error_code='approval_denied', error_message='approval denied'
+             error_code='approval_denied', error_message=$3
              WHERE community_id=$1 AND id=$2",
         )
         .bind(community_id.as_uuid())
         .bind(run_id)
+        .bind(cancel_message)
         .execute(tx.conn())
         .await?;
     }

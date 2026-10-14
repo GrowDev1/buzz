@@ -78,7 +78,6 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i functions/enforce_community_write_fence.sql
 \i functions/enforce_community_tombstone.sql
 \i functions/attach_community_write_fence.sql
-\i functions/platform_claim_approval.sql
 
 -- tables
 \i tables/public/communities.sql
@@ -95,6 +94,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/workflow_runs.sql
 \i tables/public/workflow_approvals.sql
 \i tables/public/platform_approval_resume_claims.sql
+\i functions/platform_claim_approval.sql
 \i tables/public/scheduled_workflow_fires.sql
 \i tables/public/api_tokens.sql
 \i tables/public/rate_limit_violations.sql
