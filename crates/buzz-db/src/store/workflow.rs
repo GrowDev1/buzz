@@ -1483,10 +1483,12 @@ pub async fn deny_approval(
     cancel_message: &str,
 ) -> Result<bool> {
     let changed = sqlx::query(
-        "UPDATE workflow_approvals SET status='denied', approver_pubkey=$3, denied_at=now(), note=$4
+        // The trim and comparison mirror the relay's check_approver_spec (Rust
+        // str::trim = Unicode White_Space) and platform_claim_approval.
+        r#"UPDATE workflow_approvals SET status='denied', approver_pubkey=$3, denied_at=now(), note=$4
          WHERE community_id=$1 AND token=$2 AND status='pending' AND expires_at>clock_timestamp()
-           AND (btrim(approver_spec) IN ('', 'any')
-                OR lower(btrim(approver_spec)) = encode($3::bytea,'hex'))",
+           AND (regexp_replace(approver_spec, '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$', '', 'g') IN ('', 'any')
+                OR lower(regexp_replace(approver_spec, '^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$', '', 'g')) = encode($3::bytea,'hex'))"#,
     )
     .bind(community_id.as_uuid())
     .bind(token_hash)

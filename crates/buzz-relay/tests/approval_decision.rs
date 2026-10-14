@@ -98,11 +98,20 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
         "deny-any",
         "grant-upper",
         "deny-upper",
+        "grant-pad",
+        "deny-pad",
+        "grant-unicode-pad",
+        "deny-unicode-pad",
     ] {
         let spec = if decision.ends_with("-any") {
             "any".to_owned()
         } else if decision.ends_with("-upper") {
             owner.public_key().to_hex().to_uppercase()
+        } else if decision.ends_with("-unicode-pad") {
+            // No-break space and ideographic space: Rust trims both.
+            format!("\u{a0}{}\u{3000}", owner.public_key().to_hex())
+        } else if decision.ends_with("-pad") {
+            format!("\t{}\n", owner.public_key().to_hex())
         } else {
             owner.public_key().to_hex()
         };
