@@ -81,7 +81,7 @@ enum PersistResult {
     /// Event was already processed — return idempotent success.
     Duplicate,
     /// Event inserted — transaction is open, handler must commit after mutations.
-    Inserted(sqlx::Transaction<'static, sqlx::Postgres>),
+    Inserted(buzz_db::AdmittedTx),
 }
 
 /// Persist a command event inside a transaction. Returns the OPEN transaction
@@ -108,14 +108,13 @@ async fn persist_command_event(
 
     let channel_id = channel_id_override.or_else(|| extract_channel_id(event));
     let mut tx = db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(tenant.community())
         .await
-        .map_err(|e| IngestError::Internal(format!("error: begin transaction: {e}")))?;
-    buzz_deletion::store(db)
-        .guard_transaction(&mut tx, tenant.community())
-        .await
-        .map_err(|error| {
-            IngestError::Rejected(format!("restricted: community writes are fenced: {error}"))
+        .map_err(|error| match error {
+            buzz_db::DbError::AccessDenied(_) => {
+                IngestError::Rejected(format!("restricted: community writes are fenced: {error}"))
+            }
+            error => IngestError::Internal(format!("error: begin transaction: {error}")),
         })?;
 
     let d_tag = buzz_db::event::extract_d_tag(event);
@@ -146,7 +145,6 @@ async fn persist_command_event(
         let result = db
             .replace_parameterized_event_in_transaction(
                 &mut tx,
-                tenant.community(),
                 event,
                 d_tag,
                 channel_id,
@@ -183,10 +181,9 @@ async fn persist_command_event(
         };
     }
 
-    let (_, was_inserted) =
-        buzz_db::event::insert_event_in_transaction(&mut tx, tenant.community(), event, channel_id)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
+    let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(&mut tx, event, channel_id)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
     if was_inserted {
         Ok(PersistResult::Inserted(tx))
     } else {
@@ -1087,26 +1084,15 @@ async fn decide_approval(
         PersistResult::Inserted(tx) => tx,
     };
     // Lock in the same order as the durable claim. Snapshot these rows while locked.
-    sqlx::query(
-        "SELECT token FROM workflow_approvals WHERE community_id=$1 AND token=$2 FOR UPDATE",
+    buzz_db::workflow::lock_approval_for_decision(
+        &mut tx,
+        community_id,
+        &token,
+        approval.run_id,
+        approval.workflow_id,
     )
-    .bind(community_id.as_uuid())
-    .bind(&token)
-    .fetch_one(&mut *tx)
     .await
     .map_err(|e| IngestError::Internal(e.to_string()))?;
-    sqlx::query("SELECT id FROM workflow_runs WHERE community_id=$1 AND id=$2 FOR UPDATE")
-        .bind(community_id.as_uuid())
-        .bind(approval.run_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| IngestError::Internal(e.to_string()))?;
-    sqlx::query("SELECT id FROM workflows WHERE community_id=$1 AND id=$2 FOR UPDATE")
-        .bind(community_id.as_uuid())
-        .bind(approval.workflow_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| IngestError::Internal(e.to_string()))?;
     let run = state
         .db
         .get_workflow_run(community_id, approval.run_id)
@@ -1148,15 +1134,16 @@ async fn decide_approval(
             .await
             .map_err(|e| IngestError::Internal(e.to_string()))?
     } else {
-        let changed = sqlx::query("UPDATE workflow_approvals SET status='denied', approver_pubkey=$3, denied_at=now(), note=$4 WHERE community_id=$1 AND token=$2 AND status='pending' AND expires_at>clock_timestamp() AND approver_spec=encode($3::bytea,'hex')")
-            .bind(community_id.as_uuid()).bind(&token).bind(signer.as_slice()).bind(&event.content)
-            .execute(&mut *tx).await.map_err(|e| IngestError::Internal(e.to_string()))?.rows_affected()==1;
-        if changed {
-            sqlx::query("UPDATE workflow_runs SET status='cancelled', completed_at=now(), error_code='approval_denied', error_message='approval denied' WHERE community_id=$1 AND id=$2")
-                .bind(community_id.as_uuid()).bind(run.id).execute(&mut *tx).await
-                .map_err(|e| IngestError::Internal(e.to_string()))?;
-        }
-        changed
+        buzz_db::workflow::deny_approval(
+            &mut tx,
+            community_id,
+            &token,
+            &signer,
+            &event.content,
+            run.id,
+        )
+        .await
+        .map_err(|e| IngestError::Internal(e.to_string()))?
     };
     if !changed {
         return Err(IngestError::Rejected(
@@ -1511,12 +1498,11 @@ mod postgres_tests {
         );
 
         let mut tx = db
-            .begin_event_write_transaction()
+            .begin_event_write_transaction(tenant.community())
             .await
             .expect("begin legacy seed");
         let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(
             &mut tx,
-            tenant.community(),
             &legacy,
             extract_channel_id(&legacy),
         )

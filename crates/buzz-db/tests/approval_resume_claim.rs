@@ -6,15 +6,16 @@ use buzz_db::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn claim(pool: &PgPool, tenant: CommunityId, token: &[u8], signer: &[u8]) -> bool {
-    buzz_db::workflow::claim_approval_resume(
-        &mut pool.acquire().await.unwrap(),
-        tenant,
-        token,
-        signer,
-    )
-    .await
-    .unwrap()
+async fn claim(db: &Db, tenant: CommunityId, token: &[u8], signer: &[u8]) -> bool {
+    // An unknown community is refused at admission, which is a lost claim.
+    let Ok(mut tx) = db.begin_event_write_transaction(tenant).await else {
+        return false;
+    };
+    let won = buzz_db::workflow::claim_approval_resume(&mut tx, tenant, token, signer)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    won
 }
 
 #[tokio::test]
@@ -80,20 +81,20 @@ async fn approval_claim_is_once_only_tenant_bound_and_recoverable() {
     let approval = db.get_approval(tenant, "fictitious-s38").await.unwrap();
     assert!(
         !claim(
-            db.pool(),
+            &db,
             CommunityId::from_uuid(Uuid::new_v4()),
             &approval.token,
             &owner
         )
         .await
     );
-    assert!(!claim(db.pool(), tenant, &approval.token, &[43; 32]).await);
+    assert!(!claim(&db, tenant, &approval.token, &[43; 32]).await);
     let (a, b) = tokio::join!(
-        claim(db.pool(), tenant, &approval.token, &owner),
-        claim(db.pool(), tenant, &approval.token, &owner)
+        claim(&db, tenant, &approval.token, &owner),
+        claim(&db, tenant, &approval.token, &owner)
     );
     assert_ne!(a, b, "exactly one durable claim wins");
-    assert!(!claim(db.pool(), tenant, &approval.token, &owner).await);
+    assert!(!claim(&db, tenant, &approval.token, &owner).await);
     assert_eq!(
         db.get_approval(tenant, "fictitious-s38")
             .await
@@ -122,5 +123,5 @@ async fn approval_claim_is_once_only_tenant_bound_and_recoverable() {
         .unwrap();
     sqlx::query("UPDATE workflow_approvals SET status='pending', expires_at=now()-interval '1 second' WHERE community_id=$1 AND token=$2")
         .bind(tenant.as_uuid()).bind(&approval.token).execute(db.pool()).await.unwrap();
-    assert!(!claim(db.pool(), tenant, &approval.token, &owner).await);
+    assert!(!claim(&db, tenant, &approval.token, &owner).await);
 }

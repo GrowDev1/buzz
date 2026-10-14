@@ -15,6 +15,7 @@
 //! dropped, the next auth attempt is refused at the auth seam.
 
 use buzz_core::{CommunityId, TenantContext};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -41,6 +42,10 @@ pub fn conn_control_channel(ctx: &TenantContext) -> String {
 /// deny entries apply across the full issuer domain — the community a user is
 /// connected to at that moment is irrelevant.
 pub const NIP_FI_DISCONNECT_CHANNEL: &str = "buzz:nip-fi:disconnect";
+
+/// Channel for disconnects accepted in shadow mode.  Only shadow pods
+/// subscribe, so a shadow command never reaches an enforce pod.
+pub const NIP_FI_SHADOW_DISCONNECT_CHANNEL: &str = "buzz:nip-fi:shadow-disconnect";
 
 /// A NIP-FI admin-disconnect command broadcast cross-pod after the local deny
 /// entry is inserted.  Every pod merges this entry into its own deny map and
@@ -104,7 +109,18 @@ pub fn parse_conn_control_channel(channel: &str) -> Option<CommunityId> {
 #[serde(tag = "op")]
 pub enum ConnControl {
     /// Disconnect every live socket bound to the carrying community.
-    DisconnectCommunity,
+    ///
+    /// Archive callers include the durable archive-transition timestamp. Each
+    /// receiver checks it under a row lock before disconnecting, so a delayed
+    /// command cannot disconnect a subsequently restored community. `None`
+    /// (permanent deletion, or archive from a relay predating the timestamp)
+    /// closes only while the row is inactive, and fails closed as a deletion
+    /// when the receiver cannot evaluate that fence.
+    DisconnectCommunity {
+        /// Exact archive transition this command belongs to, when reversible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived_at: Option<DateTime<Utc>>,
+    },
     /// Disconnect every live connection authenticated as `pubkey` in the
     /// carrying community — live ban enforcement. `pubkey` is 32 raw bytes.
     /// `event_id` and `reason` reproduce the same NIP-01 `OK` frame the origin
@@ -217,17 +233,18 @@ async fn connect_and_subscribe(
 
 // ── NIP-FI disconnect subscriber ──────────────────────────────────────────────
 
-/// Subscribes to [`NIP_FI_DISCONNECT_CHANNEL`] and forwards commands to the
+/// Subscribes to `channels` and forwards commands to the
 /// broadcast.  Mirrors [`run_conn_control_subscriber`]: reconnect loop with
 /// exponential backoff.  Never returns.
 pub async fn run_nip_fi_disconnect_subscriber(
     redis_url: String,
     broadcast_tx: broadcast::Sender<NipFiDisconnect>,
+    channels: &'static [&'static str],
 ) {
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
 
     loop {
-        match connect_and_subscribe_nip_fi(&redis_url, &broadcast_tx).await {
+        match connect_and_subscribe_nip_fi(&redis_url, &broadcast_tx, channels).await {
             Ok(()) => {
                 backoff_secs = BACKOFF_INITIAL_SECS;
                 tracing::warn!(
@@ -249,15 +266,14 @@ pub async fn run_nip_fi_disconnect_subscriber(
 async fn connect_and_subscribe_nip_fi(
     redis_url: &str,
     broadcast_tx: &broadcast::Sender<NipFiDisconnect>,
+    channels: &[&str],
 ) -> Result<(), redis::RedisError> {
     let client = redis::Client::open(redis_url)?;
     let mut conn = client.get_async_pubsub().await?;
 
-    conn.subscribe(NIP_FI_DISCONNECT_CHANNEL).await?;
+    conn.subscribe(channels).await?;
 
-    tracing::info!(
-        "Redis NIP-FI disconnect subscriber connected — listening on {NIP_FI_DISCONNECT_CHANNEL}"
-    );
+    tracing::info!("Redis NIP-FI disconnect subscriber connected — listening on {channels:?}");
 
     let mut stream = conn.on_message();
     while let Some(msg) = stream.next().await {
@@ -325,18 +341,55 @@ mod tests {
 
     #[test]
     fn disconnect_community_command_serde_round_trips() {
-        let cmd = ConnControl::DisconnectCommunity;
+        let cmd = ConnControl::DisconnectCommunity { archived_at: None };
         let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"op":"DisconnectCommunity"}"#);
         assert_eq!(serde_json::from_str::<ConnControl>(&json).unwrap(), cmd);
+    }
+
+    #[test]
+    fn archived_community_disconnect_carries_the_lifecycle_fence() {
+        let archived_at = chrono::DateTime::parse_from_rfc3339("2026-08-31T12:34:56.123456Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cmd = ConnControl::DisconnectCommunity {
+            archived_at: Some(archived_at),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains(r#""archived_at":"2026-08-31T12:34:56.123456Z""#));
+        assert_eq!(serde_json::from_str::<ConnControl>(&json).unwrap(), cmd);
+    }
+
+    #[test]
+    fn legacy_consumer_accepts_archived_community_disconnect_payload() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(tag = "op")]
+        enum LegacyConnControl {
+            DisconnectCommunity,
+        }
+
+        let archived_at = chrono::DateTime::parse_from_rfc3339("2026-08-31T12:34:56.123456Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let json = serde_json::to_string(&ConnControl::DisconnectCommunity {
+            archived_at: Some(archived_at),
+        })
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<LegacyConnControl>(&json).unwrap(),
+            LegacyConnControl::DisconnectCommunity
+        );
     }
 
     #[test]
     fn unknown_command_is_rejected_without_affecting_later_messages() {
         assert!(serde_json::from_str::<ConnControl>(r#"{"op":"FutureCommand"}"#).is_err());
-        let known = serde_json::to_string(&ConnControl::DisconnectCommunity).unwrap();
+        let known =
+            serde_json::to_string(&ConnControl::DisconnectCommunity { archived_at: None }).unwrap();
         assert_eq!(
             serde_json::from_str::<ConnControl>(&known).unwrap(),
-            ConnControl::DisconnectCommunity
+            ConnControl::DisconnectCommunity { archived_at: None }
         );
     }
 

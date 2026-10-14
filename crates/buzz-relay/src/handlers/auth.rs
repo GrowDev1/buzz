@@ -62,23 +62,35 @@ fn classify_relay_membership(
 /// Fails closed: a DB error is `DbError`, never `Clear`. NIP-OA cascade: a ban
 /// on the principal blocks it directly; if the principal is clear, a ban on
 /// its proven owner (extracted from the self-proving auth tag) blocks it too.
+///
+/// `cached` reads the restriction rows through the 30-second ephemeral-path
+/// cache ([`AppState::restriction_state_cached`]); only per-pulse ephemeral
+/// traffic sets it. Socket auth and every other HTTP request read fresh.
 pub(crate) async fn community_ban_outcome(
     state: &AppState,
     community: buzz_core::CommunityId,
     pubkey: nostr::PublicKey,
     auth_tag_json: Option<&str>,
     signed_auth_created_at: Option<u64>,
+    cached: bool,
 ) -> BanOutcome {
     async fn lookup(
         state: &AppState,
         community: buzz_core::CommunityId,
         key: &nostr::PublicKey,
+        cached: bool,
     ) -> BanOutcome {
-        match state
-            .db
-            .moderation_restriction_state(community, key.as_bytes())
-            .await
-        {
+        let restriction = if cached {
+            state
+                .restriction_state_cached(community, key.as_bytes())
+                .await
+        } else {
+            state
+                .db
+                .moderation_restriction_state(community, key.as_bytes())
+                .await
+        };
+        match restriction {
             Ok(restriction) if restriction.banned => BanOutcome::Banned,
             Ok(_) => BanOutcome::Clear,
             Err(e) => {
@@ -87,7 +99,7 @@ pub(crate) async fn community_ban_outcome(
             }
         }
     }
-    let outcome = lookup(state, community, &pubkey).await;
+    let outcome = lookup(state, community, &pubkey, cached).await;
     if outcome != BanOutcome::Clear {
         return outcome;
     }
@@ -96,7 +108,7 @@ pub(crate) async fn community_ban_outcome(
         auth_tag_json,
         signed_auth_created_at,
     ) {
-        Some(owner) => lookup(state, community, &owner).await,
+        Some(owner) => lookup(state, community, &owner, cached).await,
         None => BanOutcome::Clear,
     }
 }
@@ -146,6 +158,7 @@ pub(crate) async fn final_admission_denial(
         pubkey,
         auth_tag_json,
         signed_auth_created_at,
+        false,
     )
     .await;
     if let Some((metric, reason, outcome)) = ban_denial(ban) {
@@ -347,6 +360,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);
     let auth_svc = Arc::clone(&state.auth);
 
+    let _shadow_attempt =
+        crate::nip_fi_shadow_session::AuthAttempt(conn.community_control.nip_fi_shadow());
     // Pure NIP-42 verification — crypto only, no DB lookups.
     match auth_svc
         .verify_auth_event(event, &challenge, &relay_url)
@@ -355,6 +370,10 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
 
+            let shadow = conn.community_control.nip_fi_shadow();
+            if let Some(shadow) = shadow {
+                shadow.observe_pairing(pubkey);
+            }
             // NIP-FI key pairing [FI-INV-05]: immediately after successful
             // verify_auth_event, before community-ban/allowlist/membership gates.
             // Pre-DB positioning means a denied caller pays zero DB cost and the
@@ -396,6 +415,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     pubkey,
                     auth_tag_json.as_deref(),
                     Some(signed_auth_created_at),
+                    false,
                 )
                 .await;
 
@@ -719,6 +739,10 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     }
                 }
             }
+            if let Some(shadow) = shadow {
+                shadow.observe_deny_set(&state);
+                shadow.admit();
+            }
             // A concurrent `disconnect_nip_fi` may have closed this session
             // after the deny-set check; its denial is the terminal reply.
             if conn.cancel.is_cancelled() {
@@ -867,7 +891,7 @@ mod tests {
         // Fix 5: use Config::for_test() which holds NIP_FI_ENV_LOCK internally. [FI-TRACE-ENV-RACE]
         let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
-        config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string();
+        config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string(); // sadscan:disable np.postgres.1
         config.redis_url = "redis://127.0.0.1:1".to_string();
         // 100ms acquire timeout: a request that falls through to the stub
         // pool still waits, but for 100ms instead of sqlx's 30s default.
@@ -1424,8 +1448,160 @@ mod tests {
     // DB is available. The postgres-ci nextest lane discovers it via the `ignore`
     // attribute — do not remove the ignore even if a local DB is reachable.
     // [Fix 8: FI-TRACE-ISOLATED-DB]
+    /// A pending test connection observed by a shadow session asserting
+    /// `asserted` for `lifetime`, and an AUTH event `signer` signs for it.
+    pub(super) fn shadow_root_conn(
+        state: &crate::state::AppState,
+        asserted: nostr::PublicKey,
+        signer: &Keys,
+        lifetime: chrono::Duration,
+    ) -> (crate::connection::tests::TestConn, nostr::Event) {
+        use chrono::Utc;
+        let challenge = "shadow-root-challenge".to_owned();
+        let pending = AuthState::Pending {
+            challenge: challenge.clone(),
+            started_at: Instant::now(),
+        };
+        let t = crate::connection::tests::test_conn(pending, None);
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(asserted), vec![Utc::now() + lifetime]);
+        let headers = axum::http::HeaderMap::new();
+        let session = crate::nip_fi_shadow_session::ShadowSession::start(
+            state,
+            "ws",
+            &headers,
+            assertion,
+            Utc::now(),
+        );
+        t.conn.community_control.attach_nip_fi_shadow(Some(session));
+        let event = EventBuilder::new(Kind::Authentication, "")
+            .tag(Tag::parse(["relay", "ws://test.local"]).unwrap())
+            .tag(Tag::parse(["challenge", &challenge]).unwrap())
+            .sign_with_keys(signer)
+            .unwrap();
+        (t, event)
+    }
+
+    // Shadow records pairing where enforce pairs, before any DB gate.
+    // Mutation: deleting root's `observe_pairing` call records nothing.
+    #[test]
+    fn shadow_root_auth_records_pairing_denial() {
+        use crate::nip_fi_shadow_session::tests::{shadow_records, shadow_state};
+        let records = shadow_records(async {
+            let state = std::sync::Arc::new(shadow_state(None).await);
+            let (t, event) = shadow_root_conn(
+                &state,
+                Keys::generate().public_key(),
+                &Keys::generate(),
+                HOUR,
+            );
+            handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+        });
+        assert_eq!(records, ["pairing/denied"]);
+    }
+
+    const HOUR: chrono::Duration = chrono::Duration::hours(1);
+
+    /// Fires the connection's shadow deadline once its AUTH has finished,
+    /// in place of waiting for the timer.
+    fn expire_shadow(t: &crate::connection::tests::TestConn) {
+        t.conn.community_control.nip_fi_shadow().unwrap().expire();
+    }
+
+    // A NIP-42 failure, a wrong challenge or a corrupted signature, ends the
+    // AUTH without a NIP-FI decision; the socket stays open until its auth
+    // timeout, but its observation is retired, so the deadline records
+    // nothing. Mutation: dropping the `AuthAttempt` guard records
+    // `deadline/rejected`.
+    #[test]
+    fn shadow_root_invalid_nip42_retires_without_record() {
+        use crate::nip_fi_shadow_session::tests::{shadow_records, shadow_state};
+        let records = shadow_records(async {
+            let state = std::sync::Arc::new(shadow_state(None).await);
+            let key = Keys::generate();
+            let wrong_challenge = EventBuilder::new(Kind::Authentication, "")
+                .tag(Tag::parse(["challenge", "other-challenge"]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            let (_, signed) = shadow_root_conn(&state, key.public_key(), &key, HOUR);
+            let mut corrupted = serde_json::to_value(&signed).unwrap();
+            let sig = corrupted["sig"].as_str().unwrap();
+            let flipped = if sig.starts_with('0') { "1" } else { "0" };
+            corrupted["sig"] = format!("{flipped}{}", &sig[1..]).into();
+            let corrupted: nostr::Event = serde_json::from_value(corrupted).unwrap();
+            for event in [wrong_challenge, corrupted] {
+                let (t, _) = shadow_root_conn(&state, key.public_key(), &key, HOUR);
+                handle_auth(
+                    event,
+                    std::sync::Arc::clone(&t.conn),
+                    std::sync::Arc::clone(&state),
+                )
+                .await;
+                assert!(!t.conn.cancel.is_cancelled(), "socket stays open");
+                expire_shadow(&t);
+            }
+        });
+        assert!(records.is_empty(), "{records:?}");
+    }
+
     mod postgres_tests {
         use super::*;
+
+        // Shadow records the deny-set check where enforce runs it, and admits
+        // with OK(true) either way, as Off does. Mutation: deleting root's
+        // `observe_admission` call records nothing.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn shadow_root_auth_records_deny_set_or_admit_and_admits_as_off() {
+            use crate::nip_fi_shadow_session::tests::{shadow_records, shadow_state};
+            for (deny_self, expected) in [(true, "deny_set/denied"), (false, "admit/admit")] {
+                let mut ok_true = false;
+                let records = shadow_records(async {
+                    let key = Keys::generate();
+                    let shadow = shadow_state(deny_self.then(|| key.public_key())).await;
+                    let mut state = (*auth_test_state_real_db_expect().await).clone();
+                    state.nip_fi_deny_map = shadow.nip_fi_deny_map;
+                    let state = std::sync::Arc::new(state);
+                    let (mut t, event) =
+                        super::shadow_root_conn(&state, key.public_key(), &key, super::HOUR);
+                    handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+                    while let Ok(WsMessage::Text(text)) = t.send_rx.try_recv() {
+                        ok_true |= is_ok_true(text.as_str());
+                    }
+                });
+                assert!(ok_true, "shadow admits as Off (deny_self = {deny_self})");
+                assert_eq!(records, [expected]);
+            }
+        }
+
+        // A paired proof refused by ordinary membership policy ends the AUTH
+        // without a NIP-FI decision, so the deadline records nothing.
+        // Mutation: dropping the `AuthAttempt` guard records
+        // `deadline/rejected`.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn shadow_root_policy_refusal_retires_without_record() {
+            use crate::nip_fi_shadow_session::tests::{shadow_records, shadow_state};
+            let records = shadow_records(async {
+                let key = Keys::generate();
+                let mut state = (*auth_test_state_real_db_expect().await).clone();
+                let mut config = (*state.config).clone();
+                config.require_relay_membership = true;
+                state.config = std::sync::Arc::new(config);
+                state.nip_fi_deny_map = shadow_state(None).await.nip_fi_deny_map;
+                let state = std::sync::Arc::new(state);
+                let (mut t, event) =
+                    super::shadow_root_conn(&state, key.public_key(), &key, super::HOUR);
+                handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+                let refused = t.send_rx.try_recv();
+                assert!(
+                    format!("{refused:?}").contains("not a relay member"),
+                    "{refused:?}"
+                );
+                super::expire_shadow(&t);
+            });
+            assert!(records.is_empty(), "{records:?}");
+        }
 
         /// A community whose row exists, so bans and users can reference it.
         async fn seeded_community(

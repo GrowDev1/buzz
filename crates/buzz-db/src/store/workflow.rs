@@ -21,7 +21,7 @@ use uuid::Uuid;
 use buzz_core::CommunityId;
 
 use crate::error::{DbError, Result};
-use crate::Db;
+use crate::{AdmittedTx, Db};
 use buzz_datastore_tracing::datastore_span;
 
 // -- Token hashing ------------------------------------------------------------
@@ -290,6 +290,12 @@ pub async fn create_workflow(
     definition_json: &str,
     definition_hash: &[u8],
 ) -> Result<Uuid> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let id = Uuid::new_v4();
 
     sqlx::query(
@@ -306,8 +312,9 @@ pub async fn create_workflow(
     .bind(channel_id)
     .bind(definition_json)
     .bind(definition_hash)
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
 
     Ok(id)
 }
@@ -328,6 +335,12 @@ pub async fn upsert_workflow(
     definition_json: &str,
     definition_hash: &[u8],
 ) -> Result<()> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let row = sqlx::query(
         r#"
         INSERT INTO workflows
@@ -350,8 +363,9 @@ pub async fn upsert_workflow(
     .bind(channel_id)
     .bind(definition_json)
     .bind(definition_hash)
-    .fetch_optional(pool)
+    .fetch_optional(tx.conn())
     .await?;
+    tx.commit().await?;
 
     if row.is_none() {
         return Err(DbError::AccessDenied(format!(
@@ -507,6 +521,12 @@ pub async fn claim_scheduled_workflow_fire(
     workflow_id: Uuid,
     scheduled_for: DateTime<Utc>,
 ) -> Result<Option<ScheduledWorkflowFireClaim>> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let row = sqlx::query(
         r#"
         INSERT INTO scheduled_workflow_fires (community_id, workflow_id, scheduled_for)
@@ -520,8 +540,9 @@ pub async fn claim_scheduled_workflow_fire(
     .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(scheduled_for)
-    .fetch_optional(pool)
+    .fetch_optional(tx.conn())
     .await?;
+    tx.commit().await?;
 
     row.map(|row| {
         let community_id: Uuid = row.try_get("community_id")?;
@@ -575,6 +596,12 @@ pub async fn attach_scheduled_workflow_run(
     scheduled_for: DateTime<Utc>,
     workflow_run_id: Uuid,
 ) -> Result<bool> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let result = sqlx::query(
         r#"
         UPDATE scheduled_workflow_fires
@@ -589,8 +616,9 @@ pub async fn attach_scheduled_workflow_run(
     .bind(workflow_id)
     .bind(scheduled_for)
     .bind(workflow_run_id)
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
 
     Ok(result.rows_affected() == 1)
 }
@@ -634,6 +662,12 @@ pub async fn update_workflow(
     definition_json: &str,
     definition_hash: &[u8],
 ) -> Result<()> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let affected = sqlx::query(
         r#"
         UPDATE workflows
@@ -646,9 +680,10 @@ pub async fn update_workflow(
     .bind(definition_hash)
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(tx.conn())
     .await?
     .rows_affected();
+    tx.commit().await?;
 
     if affected == 0 {
         return Err(DbError::NotFound(format!("workflow {id}")));
@@ -666,6 +701,12 @@ pub async fn update_workflow_status(
     id: Uuid,
     status: WorkflowStatus,
 ) -> Result<()> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let affected = sqlx::query(
         r#"
         UPDATE workflows
@@ -676,9 +717,10 @@ pub async fn update_workflow_status(
     .bind(status.to_string())
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(tx.conn())
     .await?
     .rows_affected();
+    tx.commit().await?;
 
     if affected == 0 {
         return Err(DbError::NotFound(format!("workflow {id}")));
@@ -696,6 +738,12 @@ pub async fn set_workflow_enabled(
     id: Uuid,
     enabled: bool,
 ) -> Result<()> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let affected = sqlx::query(
         r#"
         UPDATE workflows
@@ -706,9 +754,10 @@ pub async fn set_workflow_enabled(
     .bind(enabled)
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(tx.conn())
     .await?
     .rows_affected();
+    tx.commit().await?;
 
     if affected == 0 {
         return Err(DbError::NotFound(format!("workflow {id}")));
@@ -729,6 +778,12 @@ pub async fn disable_workflows_for_owner_in_channel(
     channel_id: Uuid,
     owner_pubkey: &[u8],
 ) -> Result<u64> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let affected = sqlx::query(
         r#"
         UPDATE workflows
@@ -739,9 +794,10 @@ pub async fn disable_workflows_for_owner_in_channel(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(owner_pubkey)
-    .execute(pool)
+    .execute(tx.conn())
     .await?
     .rows_affected();
+    tx.commit().await?;
 
     Ok(affected)
 }
@@ -753,11 +809,16 @@ pub async fn disable_workflows_for_owner_in_channel(
 /// so the disable executes on the fence's own connection, avoiding a second
 /// pool acquisition while the fence holds one connection.
 pub async fn disable_workflows_for_owner_in_channel_on_conn(
-    conn: &mut PgConnection,
+    tx: &mut crate::AdmittedTx,
     community_id: CommunityId,
     channel_id: Uuid,
     owner_pubkey: &[u8],
 ) -> Result<u64> {
+    if tx.community() != community_id {
+        return Err(DbError::AccessDenied(
+            "workflow write community mismatch".into(),
+        ));
+    }
     let affected = sqlx::query(
         r#"
         UPDATE workflows
@@ -768,61 +829,11 @@ pub async fn disable_workflows_for_owner_in_channel_on_conn(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(owner_pubkey)
-    .execute(&mut *conn)
+    .execute(tx.conn())
     .await?
     .rows_affected();
 
     Ok(affected)
-}
-
-/// Delete a workflow and all its runs/approvals (CASCADE).
-///
-/// NOTE: see the cache-invalidation note on [`update_workflow`]. The relay's
-/// deletion path uses [`delete_workflow_for_owner`], which returns the
-/// `channel_id` needed for invalidation. (No current callers.)
-pub async fn delete_workflow(pool: &PgPool, community_id: CommunityId, id: Uuid) -> Result<()> {
-    let affected = sqlx::query("DELETE FROM workflows WHERE community_id = $1 AND id = $2")
-        .bind(community_id.as_uuid())
-        .bind(id)
-        .execute(pool)
-        .await?
-        .rows_affected();
-
-    if affected == 0 {
-        return Err(DbError::NotFound(format!("workflow {id}")));
-    }
-    Ok(())
-}
-
-/// Delete a workflow only when it belongs to `owner_pubkey`.
-///
-/// Used by event-driven deletion paths where the workflow UUID is attacker
-/// controlled. Keeping the owner predicate in the DELETE statement avoids a
-/// check-then-delete race and ensures a caller cannot delete another user's
-/// workflow just by learning its UUID.
-///
-/// Returns the deleted workflow's `channel_id` so the caller can invalidate
-/// the per-channel trigger cache without a separate lookup.
-pub async fn delete_workflow_for_owner(
-    pool: &PgPool,
-    community_id: CommunityId,
-    id: Uuid,
-    owner_pubkey: &[u8],
-) -> Result<Option<Uuid>> {
-    let row = sqlx::query(
-        "DELETE FROM workflows WHERE community_id = $1 AND id = $2 AND owner_pubkey = $3 \
-         RETURNING channel_id",
-    )
-    .bind(community_id.as_uuid())
-    .bind(id)
-    .bind(owner_pubkey)
-    .fetch_optional(pool)
-    .await?;
-
-    match row {
-        Some(row) => Ok(row.try_get("channel_id")?),
-        None => Err(DbError::NotFound(format!("workflow {id}"))),
-    }
 }
 
 // -- Workflow Run CRUD --------------------------------------------------------
@@ -839,6 +850,12 @@ pub async fn create_workflow_run(
     trigger_event_id: Option<&[u8]>,
     trigger_context: Option<&serde_json::Value>,
 ) -> Result<Uuid> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let id = Uuid::new_v4();
 
     sqlx::query(
@@ -853,8 +870,9 @@ pub async fn create_workflow_run(
     .bind(workflow_id)
     .bind(trigger_event_id)
     .bind(trigger_context)
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
 
     Ok(id)
 }
@@ -957,6 +975,12 @@ pub async fn update_workflow_run(
     trace: &serde_json::Value,
     failure: Option<WorkflowRunFailure<'_>>,
 ) -> Result<()> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let status_str = status.to_string();
     let (error_code, error) = failure
         .map(|failure| (Some(failure.code), Some(failure.message)))
@@ -985,9 +1009,10 @@ pub async fn update_workflow_run(
     .bind(&status_str) // for completed_at CASE
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(tx.conn())
     .await?
     .rows_affected();
+    tx.commit().await?;
 
     if affected == 0 {
         return Err(DbError::NotFound(format!("workflow_run {id}")));
@@ -1022,8 +1047,15 @@ pub struct CreateApprovalParams<'a> {
 /// The `token` parameter is the raw (plaintext) token. It is hashed with
 /// SHA-256 before storage so the DB never holds the raw value.
 pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) -> Result<()> {
-    let mut connection = pool.acquire().await?;
-    insert_approval(&mut connection, params).await
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        params.community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    insert_approval(tx.conn(), params).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Atomically persist a hashed approval and suspend its running workflow.
@@ -1033,7 +1065,12 @@ pub async fn suspend_for_approval(
     params: CreateApprovalParams<'_>,
     trace: &serde_json::Value,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        params.community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let changed = sqlx::query(
         "UPDATE workflow_runs SET status='waiting_approval', current_step=$4,
          execution_trace=execution_trace || $5::jsonb
@@ -1044,7 +1081,7 @@ pub async fn suspend_for_approval(
     .bind(params.workflow_id)
     .bind(params.step_index)
     .bind(trace)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?
     .rows_affected();
     if changed != 1 {
@@ -1052,7 +1089,7 @@ pub async fn suspend_for_approval(
             "approval requires a running run".into(),
         ));
     }
-    insert_approval(&mut tx, params).await?;
+    insert_approval(tx.conn(), params).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1209,6 +1246,12 @@ pub async fn update_approval_by_stored_hash(
     approver_pubkey: Option<&[u8]>,
     note: Option<&str>,
 ) -> Result<bool> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community_id,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let status_str = status.to_string();
     let affected = sqlx::query(
         r#"
@@ -1228,9 +1271,10 @@ pub async fn update_approval_by_stored_hash(
     .bind(&status_str) // for denied_at CASE
     .bind(community_id.as_uuid())
     .bind(token_hash)
-    .execute(pool)
+    .execute(tx.conn())
     .await?
     .rows_affected();
+    tx.commit().await?;
 
     Ok(affected > 0)
 }
@@ -1341,11 +1385,40 @@ pub async fn find_by_owner_and_name(
 
 // -- Run and approval Db API --------------------------------------------------
 
+/// Lock the approval, its run and its workflow, in the order the durable
+/// claim takes them, so a decision snapshots those rows while locked.
+pub async fn lock_approval_for_decision(
+    tx: &mut AdmittedTx,
+    community_id: CommunityId,
+    token_hash: &[u8],
+    run_id: Uuid,
+    workflow_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT token FROM workflow_approvals WHERE community_id=$1 AND token=$2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .fetch_one(tx.conn())
+    .await?;
+    sqlx::query("SELECT id FROM workflow_runs WHERE community_id=$1 AND id=$2 FOR UPDATE")
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .fetch_one(tx.conn())
+        .await?;
+    sqlx::query("SELECT id FROM workflows WHERE community_id=$1 AND id=$2 FOR UPDATE")
+        .bind(community_id.as_uuid())
+        .bind(workflow_id)
+        .fetch_one(tx.conn())
+        .await?;
+    Ok(())
+}
+
 /// Consume a pending approval once and leave a durable recovery marker.
 /// Only the winning caller may dispatch the continuation. The marker must not
 /// be retried automatically: a crash can happen after an external side effect.
 pub async fn claim_approval_resume(
-    connection: &mut PgConnection,
+    tx: &mut AdmittedTx,
     community_id: CommunityId,
     token_hash: &[u8],
     signer: &[u8],
@@ -1355,9 +1428,47 @@ pub async fn claim_approval_resume(
             .bind(community_id.as_uuid())
             .bind(token_hash)
             .bind(signer)
-            .fetch_one(connection)
+            .fetch_one(tx.conn())
             .await?,
     )
+}
+
+/// Deny a pending approval for its designated signer and cancel its run.
+/// Returns `false` when the approval is no longer pending, has expired, or
+/// belongs to another signer; nothing is changed in that case.
+pub async fn deny_approval(
+    tx: &mut AdmittedTx,
+    community_id: CommunityId,
+    token_hash: &[u8],
+    signer: &[u8],
+    note: &str,
+    run_id: Uuid,
+) -> Result<bool> {
+    let changed = sqlx::query(
+        "UPDATE workflow_approvals SET status='denied', approver_pubkey=$3, denied_at=now(), note=$4
+         WHERE community_id=$1 AND token=$2 AND status='pending' AND expires_at>clock_timestamp()
+           AND approver_spec=encode($3::bytea,'hex')",
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .bind(signer)
+    .bind(note)
+    .execute(tx.conn())
+    .await?
+    .rows_affected()
+        == 1;
+    if changed {
+        sqlx::query(
+            "UPDATE workflow_runs SET status='cancelled', completed_at=now(),
+             error_code='approval_denied', error_message='approval denied'
+             WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .execute(tx.conn())
+        .await?;
+    }
+    Ok(changed)
 }
 
 impl Db {
@@ -1740,24 +1851,6 @@ impl Db {
             owner_pubkey,
         )
         .await
-    }
-
-    /// Delete a workflow and all its runs/approvals.
-    #[datastore_span(name = "delete_workflow", system = "postgresql")]
-    pub async fn delete_workflow(&self, community_id: CommunityId, id: Uuid) -> Result<()> {
-        crate::workflow::delete_workflow(&self.pool, community_id, id).await
-    }
-
-    /// Delete a workflow only when it belongs to the provided owner.
-    /// Returns the deleted workflow's `channel_id`.
-    #[datastore_span(name = "delete_workflow_for_owner", system = "postgresql")]
-    pub async fn delete_workflow_for_owner(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        owner_pubkey: &[u8],
-    ) -> Result<Option<Uuid>> {
-        crate::workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
     }
 
     /// Find a workflow by owner pubkey and name within a community. Used for
@@ -2714,9 +2807,9 @@ mod postgres_tests {
     }
 
     /// Issue 4 (workflow lifecycle): deleting `A/id` must not delete `B/id`
-    /// when both communities hold the same workflow UUID. Pre-fix
-    /// `delete_workflow` predicated only on `id`, so a NIP-09 a-tag deletion in
-    /// one community would erase the colliding workflow in every community.
+    /// when both communities hold the same workflow UUID. Pre-fix the workflow
+    /// delete predicated only on `id`, so a NIP-09 a-tag deletion in one
+    /// community would erase the colliding workflow in every community.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn workflow_delete_is_confined_to_its_community() {
@@ -2742,7 +2835,13 @@ mod postgres_tests {
         )
         .await;
 
-        delete_workflow(&pool, community_a, shared_workflow_id)
+        crate::Db::from_pool(pool.clone())
+            .delete_workflow_by_coordinate(
+                community_a,
+                &[0xb2; 32],
+                &shared_workflow_id.to_string(),
+                chrono::Utc::now().timestamp(),
+            )
             .await
             .expect("delete A's workflow");
 

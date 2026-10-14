@@ -15,7 +15,7 @@ use axum::{
 use base64::Engine;
 use serde_json::Value;
 
-use buzz_auth::{LimitType, Nip98ReplayGuard, NipFiMode, DEFAULT_REPLAY_TTL_SECS};
+use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
@@ -67,6 +67,17 @@ pub(crate) struct VerifiedBridgeAuth {
     pub(crate) pubkey: nostr::PublicKey,
     pub(crate) event_id_bytes: [u8; 32],
     pub(crate) signed_created_at: Option<u64>,
+}
+
+impl VerifiedBridgeAuth {
+    /// The admission proof; the dev-mode `X-Pubkey` zero event ID is unsigned.
+    pub(crate) fn proof<X>(&self, extra: X) -> Nip98Proof<X> {
+        if self.event_id_bytes == [0; 32] {
+            Nip98Proof::unsigned(self.pubkey, extra)
+        } else {
+            Nip98Proof::new(self.pubkey, extra)
+        }
+    }
 }
 
 type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
@@ -213,7 +224,7 @@ pub(crate) fn make_nip98_closure_for_admission(
             require_auth_token,
             require_payload,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     }
 }
@@ -675,6 +686,7 @@ async fn handle_channel_window_filter(
     raw: &Value,
     filter: &nostr::Filter,
     accessible_channels: &[uuid::Uuid],
+    reader_pubkey_bytes: &[u8],
     events: &mut Vec<Value>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     use buzz_core::kind::{KIND_THREAD_SUMMARY, KIND_WINDOW_BOUNDS};
@@ -779,7 +791,12 @@ async fn handle_channel_window_filter(
                 }
                 // Deletions can be stored channel-less; access-check instead
                 // of channel-constraining so they aren't silently dropped.
-                if !event_in_accessible_channel(&se, accessible_channels) {
+                if !event_in_accessible_channel(&se, accessible_channels)
+                    || !crate::handlers::req::event_visible_to_reader(
+                        &se.event,
+                        reader_pubkey_bytes,
+                    )
+                {
                     continue;
                 }
                 hop_ids.push(se.event.id.to_hex());
@@ -894,13 +911,9 @@ pub async fn submit_event(
     // before any tenant-scoped write, identical to the WS door in `router.rs`.
     // Unmapped host or lookup failure fails closed with a generic 404 — never a
     // default tenant, never echoing the host.
-    let raw_host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+    let tenant = crate::nip_fi_shadow::bind_tenant(&state, &headers)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -912,15 +925,18 @@ pub async fn submit_event(
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory —
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
     // POST /events carries an authorization-relevant body (the event determines
     // resource, effect, and state change), so a payload tag is required in
     // NIP-FI enforce mode. [NIP-FI.md:619-637]
-    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
+    let nip_fi_enforce = state.config.nip_fi.mode.enforces();
 
     // NIP-FI admission: NIP-98 extraction runs inside the closure, followed by
     // assertion verify → pair → deny-map in fixed order. The proven pubkey is
     // only available through the returned NipFiAdmission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
             &headers,
@@ -930,7 +946,7 @@ pub async fn submit_event(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -1108,17 +1124,33 @@ async fn submit_event_authed(
         }
     };
 
+    let kind_u32 = buzz_core::kind::event_kind_u32(&event);
+    let is_typing = kind_u32 == buzz_core::kind::KIND_TYPING_INDICATOR;
+
     // Enforce relay membership (with NIP-OA fallback via x-auth-tag header).
+    // Typing pulses arrive every few seconds per working agent, so their ban
+    // check uses the same short-TTL cache as their write-restriction check.
     let auth_tag = super::relay_members::extract_auth_tag_header(headers);
-    let nip_oa_owner = match super::relay_members::enforce_relay_membership(
-        state,
-        tenant.community(),
-        &pubkey_bytes,
-        auth_tag,
-        signed_auth_created_at,
-    )
-    .await
-    {
+    let membership = if is_typing {
+        super::relay_members::enforce_relay_membership_ephemeral(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            auth_tag,
+            signed_auth_created_at,
+        )
+        .await
+    } else {
+        super::relay_members::enforce_relay_membership(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            auth_tag,
+            signed_auth_created_at,
+        )
+        .await
+    };
+    let nip_oa_owner = match membership {
         Ok(owner) => owner.or_else(|| {
             if !state.config.require_relay_membership {
                 super::relay_members::extract_nip_oa_owner(
@@ -1141,14 +1173,27 @@ async fn submit_event_authed(
         super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
     }
 
-    let kind_u32 = buzz_core::kind::event_kind_u32(&event);
     let auth = IngestAuth::Http {
         pubkey,
         scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
     };
 
-    match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
+    // Typing indicators are ephemeral: broadcast to the channel, never stored.
+    let result = if is_typing {
+        let event_id = event.id.to_hex();
+        crate::handlers::event::publish_http_typing(state, tenant, event, pubkey)
+            .await
+            .map(|()| crate::handlers::ingest::IngestResult {
+                event_id,
+                accepted: true,
+                message: String::new(),
+            })
+    } else {
+        crate::handlers::ingest::ingest_event(state, tenant, event, auth).await
+    };
+
+    match result {
         Ok(result) => {
             let response = Json(serde_json::json!({
                 "event_id": result.event_id,
@@ -1221,13 +1266,9 @@ pub async fn query_events(
     // An unmapped host or lookup failure fails closed with a generic 404 — never
     // a default tenant, never echoing the host (so an unauthenticated caller
     // cannot probe which communities exist on this deployment).
-    let raw_host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+    let tenant = crate::nip_fi_shadow::bind_tenant(&state, &headers)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -1238,13 +1279,16 @@ pub async fn query_events(
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
     // POST /query carries an authorization-relevant body (filter selects the
     // resources returned), so a payload tag is required in enforce mode.
     // [NIP-FI.md:619-637]
-    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
+    let nip_fi_enforce = state.config.nip_fi.mode.enforces();
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
             &headers,
@@ -1254,7 +1298,7 @@ pub async fn query_events(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -1463,6 +1507,7 @@ async fn query_events_authed(
             raw,
             filter,
             &accessible_channels,
+            &pubkey_bytes,
             &mut events,
         )
         .await?;
@@ -1852,13 +1897,9 @@ pub async fn count_events(
     // before any tenant-scoped read, identical to the WS door in `router.rs`
     // and `query_events`/`submit_event` above. Fail-closed; never a default
     // tenant, never echoing the host.
-    let raw_host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+    let tenant = crate::nip_fi_shadow::bind_tenant(&state, &headers)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -1869,13 +1910,16 @@ pub async fn count_events(
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
     // In NIP-FI enforce/deny-protected mode, a real NIP-98 event is mandatory.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
     // POST /count carries an authorization-relevant body (filter selects what
     // is counted), so a payload tag is required in enforce mode.
     // [NIP-FI.md:619-637]
-    let nip_fi_enforce = matches!(state.config.nip_fi.mode, NipFiMode::Enforce);
+    let nip_fi_enforce = state.config.nip_fi.mode.enforces();
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(&state, &headers, "bridge", || {
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(&state, &headers, || {
         verify_bridge_auth_with_options(
             &headers,
@@ -1885,7 +1929,7 @@ pub async fn count_events(
             state.config.require_auth_token || nip_fi_active,
             nip_fi_enforce,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, (auth.event_id_bytes, auth.signed_created_at)))
+        .map(|auth| auth.proof((auth.event_id_bytes, auth.signed_created_at)))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -2667,13 +2711,9 @@ async fn authorize_moderation_read(
     path: &str,
     raw_query: Option<&str>,
 ) -> Result<TenantContext, Response> {
-    let raw_host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+    let tenant = crate::nip_fi_shadow::bind_tenant(state, headers)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             api_error(
                 StatusCode::NOT_FOUND,
                 "relay: no community is configured for this host",
@@ -2689,9 +2729,12 @@ async fn authorize_moderation_read(
     // In NIP-FI enforce/deny-protected mode a real NIP-98 event is mandatory —
     // the X-Pubkey dev-mode fallback must never satisfy the pairing requirement.
     // [NIP-FI.md:594-607, FI-TRACE-HTTP-INGRESS]
-    let nip_fi_active = !matches!(state.config.nip_fi.mode, NipFiMode::Off);
+    let nip_fi_active = state.config.nip_fi.mode.restricts();
 
     // NIP-FI admission. [FI-TRACE-AUTHORITY-UNIFORM]
+    crate::nip_fi_shadow::observe_strict_proof(state, headers, "bridge", || {
+        verify_bridge_auth(headers, "GET", &url, None, true).map(drop)
+    });
     let admission = admit_nip_fi_http_on_state(state, headers, || {
         verify_bridge_auth(
             headers,
@@ -2700,7 +2743,7 @@ async fn authorize_moderation_read(
             None,
             state.config.require_auth_token || nip_fi_active,
         )
-        .map(|auth| Nip98Proof::new(auth.pubkey, auth.event_id_bytes))
+        .map(|auth| auth.proof(auth.event_id_bytes))
         .map_err(|e| e.into_response())
     })?;
     let pubkey = *admission.proven_pubkey();
@@ -2911,7 +2954,11 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
 mod artifact_postgres_tests;
 
 #[cfg(test)]
-mod postgres_tests {
+#[path = "typing_postgres_tests.rs"]
+mod typing_postgres_tests;
+
+#[cfg(test)]
+pub(crate) mod postgres_tests {
     use super::*;
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
     use std::sync::Mutex;
@@ -4290,7 +4337,7 @@ mod postgres_tests {
     /// - Redis pool points at the local dev instance for the admission check.
     ///
     /// Returns `None` when local Postgres is not reachable.
-    pub(super) async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
+    pub(crate) async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
         let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.database_url = crate::test_support::database_url();
         // Use the real local Redis so enforce_http_admission can pass.
@@ -4824,6 +4871,7 @@ mod postgres_tests {
         pubkey_hex: &str,
         body: &[u8],
     ) -> (axum::http::StatusCode, String) {
+        let _tracing = crate::test_support::tracing_dispatch_lock();
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let make_writer = CapturingMakeWriter {
             buf: Arc::clone(&buf),
@@ -5059,18 +5107,39 @@ mod postgres_tests {
         Some(Arc::new(state))
     }
 
-    // EC P-256 test key constants shared by positive-control and cardinality tests.
-    // Private key (PKCS#8 PEM) + public key coordinates (JWK x/y/kid).
-    // Used by `nip_fi_enforce_test_state_with_verifier()` and
-    // `signed_assertion_for_pubkey()`.
     const HANDLER_TEST_ISSUER: &str = "https://issuer.example";
     const HANDLER_TEST_AUDIENCE: &str = "https://relay.example";
     const HANDLER_TEST_KID: &str = "test-key-1";
-    const HANDLER_TEST_EC_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcnxDM4EiirH9dHUE\n\
-        WZc759TX4s5PAn8kO5ovXSnGxCWhRANCAARFb6ZnsfkqOOXyEhj3KBQphGKF4vTa\n\
-        zhebbavbZ1ZoklqkF1cGg+jTO7rONAVEzXvXUWtV6CdDV+rybiVmFP2w\n\
-        -----END PRIVATE KEY-----\n";
+
+    /// Ephemeral signing material shared by the test signer and verifier.
+    /// Never persist a private key fixture in source or on disk.
+    fn handler_test_key() -> &'static (jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        static KEY: std::sync::OnceLock<(jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet)> =
+            std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let rng = ring::rand::SystemRandom::new();
+            let algorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
+            let der = EcdsaKeyPair::generate_pkcs8(algorithm, &rng).expect("generate test key");
+            let pair = EcdsaKeyPair::from_pkcs8(algorithm, der.as_ref(), &rng)
+                .expect("parse generated test key");
+            // P-256 public keys use uncompressed SEC1: 0x04 || x || y.
+            let public = pair.public_key().as_ref();
+            assert_eq!(public.len(), 65);
+            assert_eq!(public[0], 4);
+            let jwks = serde_json::from_value(serde_json::json!({
+                "keys": [{
+                    "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
+                    "kid": HANDLER_TEST_KID,
+                    "x": URL_SAFE_NO_PAD.encode(&public[1..33]),
+                    "y": URL_SAFE_NO_PAD.encode(&public[33..65])
+                }]
+            }))
+            .expect("valid generated JWKS");
+            (jsonwebtoken::EncodingKey::from_ec_der(der.as_ref()), jwks)
+        })
+    }
 
     /// Build a NIP-FI Enforce AppState with a real injected P-256 verifier.
     ///
@@ -5082,19 +5151,11 @@ mod postgres_tests {
             AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
             IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
         };
-        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+        use jsonwebtoken::Algorithm;
 
         let mut state = (*nip_fi_enforce_test_state().await?).clone();
 
-        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
-                "kid": HANDLER_TEST_KID,
-                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
-                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
-            }]
-        }))
-        .expect("valid test JWKS");
+        let jwks = handler_test_key().1.clone();
         let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
         let key_set =
             AssertionKeySet::new_for_test(HANDLER_TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
@@ -5130,7 +5191,7 @@ mod postgres_tests {
     /// Mint a signed NIP-FI assertion whose `nostr_pubkey` = `pubkey_hex`,
     /// using the shared HANDLER_TEST_* key material.
     fn signed_assertion_for_pubkey(pubkey_hex: &str) -> String {
-        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use jsonwebtoken::{Algorithm, Header};
         let now = chrono::Utc::now().timestamp();
         let claims = serde_json::json!({
             "iss": HANDLER_TEST_ISSUER,
@@ -5143,9 +5204,8 @@ mod postgres_tests {
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(HANDLER_TEST_KID.to_owned());
         header.typ = Some("nip-fi+jwt".to_owned());
-        let key =
-            EncodingKey::from_ec_pem(HANDLER_TEST_EC_PEM.as_bytes()).expect("valid test EC PEM");
-        jsonwebtoken::encode(&header, &claims, &key).expect("sign assertion")
+        let key = &handler_test_key().0;
+        jsonwebtoken::encode(&header, &claims, key).expect("sign assertion")
     }
 
     /// Build a HeaderMap containing a valid NIP-98 Authorization header +
@@ -6047,11 +6107,206 @@ mod postgres_tests {
         );
     }
 
+    // All accessory methods must preserve the shared admission wire contract.
+    // Keep each route independent so the unfixed adapter fails both tests.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_buzz_v1_sidebar_wire_contract() {
+        buzz_v1_wire_contract("GET", "/buzz/v1/me/sidebar?limit=1", b"").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_buzz_v1_write_wire_contract() {
+        let body = serde_json::to_vec(&serde_json::json!({"intents":[{
+            "type":"mark_through", "target":{"channel_id":uuid::Uuid::new_v4()},
+            "message_id":"ab".repeat(32)
+        }]}))
+        .expect("serialize intent");
+        buzz_v1_wire_contract("POST", "/buzz/v1/me/read-state", &body).await;
+    }
+
+    async fn buzz_v1_wire_contract(method: &str, path: &str, request_body: &[u8]) {
+        use axum::http::{header, StatusCode};
+        use buzz_auth::{CrossPodMergeResult, IssuerCapacity, NipFiDenyMap, NipFiMode};
+
+        let fixture = nip_fi_enforce_test_state_with_verifier()
+            .await
+            .expect("local Postgres");
+        let mut state = (*fixture).clone();
+        Arc::make_mut(&mut state.config).buzz_v1_enabled = true;
+        let deny_map = Arc::new(NipFiDenyMap::new(
+            10,
+            vec![IssuerCapacity {
+                issuer: HANDLER_TEST_ISSUER.to_owned(),
+                capacity: 10,
+            }],
+        ));
+        state.nip_fi_deny_map = Some(deny_map.clone());
+        let state = Arc::new(state);
+        let host = format!("bffv1-{}.local", uuid::Uuid::new_v4().simple());
+        state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community");
+        let url = format!("https://{host}{path}");
+        let actor = Keys::generate();
+        let other = Keys::generate();
+        let paired = same_key_nip98_and_assertion_headers(&actor, &url, method, request_body);
+        let (status, headers, body) = oneshot_request_full(
+            state.clone(),
+            method,
+            path,
+            &host,
+            paired.clone(),
+            request_body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admitted control: {body:?}");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("control JSON");
+        if method == "POST" {
+            // A blocked intent applies to no channel, so no row is refreshed.
+            assert_eq!(
+                body.as_ref(),
+                br#"{"channels":[],"outcomes":[{"status":"blocked"}]}"#
+            );
+        } else {
+            assert_eq!(value, serde_json::json!({"channels":[],"next_cursor":null}));
+        }
+
+        for case in [
+            "mismatch",
+            "denied",
+            "missing_nip98",
+            "invalid_nip98",
+            "missing_assertion",
+            "invalid_assertion",
+        ] {
+            let mut request_headers = paired.clone();
+            match case {
+                "mismatch" => {
+                    let assertion = signed_assertion_for_pubkey(&other.public_key().to_hex());
+                    request_headers.insert(
+                        buzz_auth::CLIENT_ATTACHED_HEADER,
+                        format!("Bearer {assertion}")
+                            .parse()
+                            .expect("assertion header"),
+                    );
+                }
+                "denied" => {
+                    let now = chrono::Utc::now();
+                    assert_eq!(
+                        deny_map.merge_cross_pod_deny(
+                            HANDLER_TEST_ISSUER,
+                            &actor.public_key(),
+                            now + chrono::Duration::minutes(5),
+                            now
+                        ),
+                        CrossPodMergeResult::Merged
+                    );
+                }
+                "missing_nip98" => {
+                    request_headers.remove(header::AUTHORIZATION);
+                }
+                "invalid_nip98" => {
+                    request_headers.insert(header::AUTHORIZATION, "Nostr invalid".parse().unwrap());
+                }
+                "missing_assertion" => {
+                    request_headers.remove(buzz_auth::CLIENT_ATTACHED_HEADER);
+                }
+                "invalid_assertion" => {
+                    request_headers.insert(
+                        buzz_auth::CLIENT_ATTACHED_HEADER,
+                        "Bearer invalid".parse().unwrap(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let (status, headers, body) = oneshot_request_full(
+                state.clone(),
+                method,
+                path,
+                &host,
+                request_headers,
+                request_body,
+            )
+            .await;
+            let missing = case.starts_with("missing_");
+            assert_eq!(
+                status,
+                if missing {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{case}"
+            );
+            assert_eq!(
+                headers[header::CONTENT_TYPE],
+                "text/plain; charset=utf-8",
+                "{case}"
+            );
+            assert_eq!(
+                body.as_ref(),
+                if missing {
+                    b"authentication required\n".as_slice()
+                } else if case.starts_with("invalid_") {
+                    b"evidence rejected\n".as_slice()
+                } else {
+                    b"authorization denied\n".as_slice()
+                },
+                "{case}"
+            );
+            assert_eq!(
+                headers
+                    .get(header::WWW_AUTHENTICATE)
+                    .map(|v| v.to_str().unwrap()),
+                missing.then_some("Nostr"),
+                "{case}"
+            );
+            // Outer assertion middleware owns its own cache policy.
+            if !case.ends_with("assertion") {
+                assert_eq!(
+                    headers[header::CACHE_CONTROL],
+                    "private, no-store",
+                    "{case}"
+                );
+            }
+        }
+
+        // Off ignores the same real deny entry, and retains application JSON for
+        // missing request auth rather than leaking the bridge's error envelope.
+        let mut off = (*state).clone();
+        Arc::make_mut(&mut off.config).nip_fi.mode = NipFiMode::Off;
+        let off = Arc::new(off);
+        assert_eq!(
+            oneshot_request_full(off.clone(), method, path, &host, paired, request_body)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status, headers, body) = oneshot_request_full(
+            off,
+            method,
+            path,
+            &host,
+            axum::http::HeaderMap::new(),
+            request_body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+        assert!(!headers.contains_key(header::WWW_AUTHENTICATE));
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("Off JSON");
+        assert_eq!(error["error"]["code"], "unauthorized");
+        assert!(uuid::Uuid::parse_str(error["error"]["request_id"].as_str().unwrap()).is_ok());
+    }
+
     // ── Caller key-pairing witness: moderation mismatched key → 403 ─────────
-    //
-    // Mirror of the GIF case through the moderation route.
-    // Falsifying mutation: remove key-pairing check → admission passes → 403 from
-    // moderation authz (not NIP-FI) with different JSON body.
     #[test]
     #[ignore = "requires Postgres"]
     fn nip_fi_enforce_moderation_mismatched_key_is_403() {
@@ -6489,7 +6744,7 @@ mod postgres_tests {
             AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
             IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
         };
-        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+        use jsonwebtoken::Algorithm;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6553,29 +6808,15 @@ mod postgres_tests {
 
         // ── 2. Build the verifier with StaticIssuerKeySource + test key ───────
         //
-        // The verifier is seeded with a known P-256 public key.  Tokens that
-        // claim `iss=https://issuer.test` will be verified against this key.
+        // The verifier is seeded with an ephemeral P-256 public key. Tokens that
+        // claim `iss=https://issuer.example` will be verified against this key.
         // A token with an all-zero signature will fail `InvalidSignatureOrClaims`
         // → DenialClass::EvidenceRejected → 403.
         //
-        // Key constants match the canonical test key in buzz-auth
-        // (verifier/tests.rs): TEST_JWK_X / TEST_JWK_Y / TEST_KID / ISSUER.
         const TEST_ISSUER: &str = "https://issuer.example";
         const TEST_AUDIENCE: &str = "https://relay.example";
-        const TEST_KID: &str = "test-key-1";
 
-        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "EC",
-                "crv": "P-256",
-                "use": "sig",
-                "alg": "ES256",
-                "kid": TEST_KID,
-                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
-                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
-            }]
-        }))
-        .expect("valid test JWKS");
+        let jwks = handler_test_key().1.clone();
 
         let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
         let key_set = AssertionKeySet::new_for_test(TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
@@ -6737,7 +6978,7 @@ mod postgres_tests {
             AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
             IssuerRegistry, StaticIssuerKeySource, TokenClass, VerifyAssertion,
         };
-        use jsonwebtoken::{jwk::JwkSet, Algorithm};
+        use jsonwebtoken::Algorithm;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6946,27 +7187,12 @@ mod postgres_tests {
             panic!("local Postgres not reachable (enforce)");
         };
 
-        // Inject the real verifier with the static test key.
+        // Inject the real verifier with the ephemeral test key.
         const TEST_ISSUER: &str = "https://issuer.example";
         const TEST_AUDIENCE: &str = "https://relay.example";
         const TEST_KID: &str = "test-key-1";
-        // PKCS#8 private key matching TEST_JWK_X/Y — same key used by
-        // nip_fi_guard_rejects_crypto_invalid_assertion_before_handler_fires.
-        const TEST_EC_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-            MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcnxDM4EiirH9dHUE\n\
-            WZc759TX4s5PAn8kO5ovXSnGxCWhRANCAARFb6ZnsfkqOOXyEhj3KBQphGKF4vTa\n\
-            zhebbavbZ1ZoklqkF1cGg+jTO7rONAVEzXvXUWtV6CdDV+rybiVmFP2w\n\
-            -----END PRIVATE KEY-----\n";
 
-        let jwks: JwkSet = serde_json::from_value(serde_json::json!({
-            "keys": [{
-                "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
-                "kid": TEST_KID,
-                "x": "RW-mZ7H5Kjjl8hIY9ygUKYRiheL02s4Xm22r22dWaJI",
-                "y": "WqQXVwaD6NM7us40BUTNe9dRa1XoJ0NX6vJuJWYU_bA"
-            }]
-        }))
-        .expect("valid test JWKS");
+        let jwks = handler_test_key().1.clone();
 
         let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
         let key_set = AssertionKeySet::new_for_test(TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
@@ -7008,7 +7234,7 @@ mod postgres_tests {
         // Mint a valid signed assertion for an arbitrary test pubkey.
         let assertion_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
         let valid_assertion = {
-            use jsonwebtoken::{Algorithm, EncodingKey, Header};
+            use jsonwebtoken::{Algorithm, Header};
             let now = chrono::Utc::now().timestamp();
             let claims = serde_json::json!({
                 "iss": TEST_ISSUER,
@@ -7021,9 +7247,8 @@ mod postgres_tests {
             let mut header = Header::new(Algorithm::ES256);
             header.kid = Some(TEST_KID.to_owned());
             header.typ = Some("nip-fi+jwt".to_owned());
-            let key =
-                EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes()).expect("valid test EC PEM");
-            jsonwebtoken::encode(&header, &claims, &key).expect("sign assertion")
+            let key = &handler_test_key().0;
+            jsonwebtoken::encode(&header, &claims, key).expect("sign assertion")
         };
 
         // Pre-condition: verifier accepts the token.
@@ -7052,7 +7277,7 @@ mod postgres_tests {
 
         // Mint a same-key assertion: nostr_pubkey = keys2's public key.
         let same_key_assertion = {
-            use jsonwebtoken::{Algorithm, EncodingKey, Header};
+            use jsonwebtoken::{Algorithm, Header};
             let now = chrono::Utc::now().timestamp();
             let claims = serde_json::json!({
                 "iss": TEST_ISSUER,
@@ -7065,9 +7290,8 @@ mod postgres_tests {
             let mut header = Header::new(Algorithm::ES256);
             header.kid = Some(TEST_KID.to_owned());
             header.typ = Some("nip-fi+jwt".to_owned());
-            let key =
-                EncodingKey::from_ec_pem(TEST_EC_PKCS8_PEM.as_bytes()).expect("valid test EC PEM");
-            jsonwebtoken::encode(&header, &claims, &key).expect("sign same-key assertion")
+            let key = &handler_test_key().0;
+            jsonwebtoken::encode(&header, &claims, key).expect("sign same-key assertion")
         };
         // Pre-condition: same-key assertion is accepted.
         assert!(
@@ -8106,6 +8330,53 @@ mod postgres_tests {
         fx.drop().await;
     }
 
+    /// HTTP agents reach `materialize_nip_oa_owner` on every request. Once the
+    /// owner link is confirmed in `observer_owner_cache` the call writes
+    /// nothing: the link is set once and never cleared.
+    /// Mutation: drop the cache short-circuit → the agent row is recreated → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres and Redis"]
+    async fn known_owner_link_skips_materialize_writes() {
+        let state = bridge_handler_test_state()
+            .await
+            .expect("local Postgres and Redis");
+        let host = format!("owner-link-{}.local", uuid::Uuid::new_v4());
+        state.db.ensure_configured_community(&host).await.unwrap();
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .unwrap();
+        let (owner, agent_key) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let materialize = || {
+            super::super::relay_members::materialize_nip_oa_owner(
+                &state, &tenant, &agent_key, &owner,
+            )
+        };
+        let agent_rows = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM users WHERE community_id = $1 AND pubkey = $2",
+            )
+            .bind(tenant.community().as_uuid())
+            .bind(agent_key.to_bytes().as_slice())
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap()
+        };
+
+        assert!(materialize().await, "first call records the link");
+        assert_eq!(agent_rows().await, 1);
+
+        // Remove the row behind the cache's back: a call that still wrote
+        // would recreate it.
+        sqlx::query("DELETE FROM users WHERE community_id = $1 AND pubkey = $2")
+            .bind(tenant.community().as_uuid())
+            .bind(agent_key.to_bytes().as_slice())
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        assert!(materialize().await, "a known link is still confirmed");
+        assert_eq!(agent_rows().await, 0, "a known link writes nothing");
+    }
+
     /// An agent socket admitted with no owner, then linked to its owner by a
     /// later `POST /events` carrying NIP-OA, closes when the owner is banned
     /// or removed even though the owner-to-agent lookup fails: recording the
@@ -8125,14 +8396,21 @@ mod postgres_tests {
                 .await
                 .expect("local Postgres and Redis");
             // A schema whose `users` table can be taken away after the link,
-            // so only the owner-to-agent lookup fails at revoke time.
+            // so only the owner-to-agent lookup fails at revoke time. It
+            // carries `communities` and the deletion lock key so writes pass
+            // community write admission.
             let db_url = crate::test_support::database_url();
             let schema = format!("late_owner_{}", uuid::Uuid::new_v4().simple());
             sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "CREATE SCHEMA {schema}; \
                  CREATE TABLE {schema}.users (LIKE public.users INCLUDING ALL); \
                  CREATE TABLE {schema}.community_bans (LIKE public.community_bans INCLUDING ALL); \
-                 CREATE TABLE {schema}.relay_members (LIKE public.relay_members INCLUDING ALL);"
+                 CREATE TABLE {schema}.relay_members (LIKE public.relay_members INCLUDING ALL); \
+                 CREATE TABLE {schema}.join_policy_acceptances \
+                     (LIKE public.join_policy_acceptances INCLUDING ALL); \
+                 CREATE TABLE {schema}.communities (LIKE public.communities INCLUDING ALL); \
+                 CREATE FUNCTION {schema}.community_deletion_lock_key(target UUID) RETURNS BIGINT \
+                 LANGUAGE SQL IMMUTABLE STRICT AS 'SELECT public.community_deletion_lock_key(target)';"
             )))
             .execute(state.db.pool())
             .await
@@ -8150,6 +8428,17 @@ mod postgres_tests {
 
             let tenant = fresh_tenant("late-owner.test");
             let other = fresh_tenant("late-owner-other.test");
+            // Both tenants pass community write admission in the schema.
+            for community in [&tenant, &other] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO {schema}.communities (id, host) VALUES ($1, $2)"
+                )))
+                .bind(community.community().as_uuid())
+                .bind(community.host())
+                .execute(&admin)
+                .await
+                .expect("seed admitted community");
+            }
             let (owner, agent) = (Keys::generate(), Keys::generate());
             let agent_bytes = agent.public_key().to_bytes();
 
