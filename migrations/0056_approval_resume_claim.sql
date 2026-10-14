@@ -33,3 +33,6 @@ BEGIN
     RETURN true;
 END;
 $$;
+
+-- Community deletion enumerates scoped tables and requires every one to be fenced.
+SELECT attach_community_write_fence('platform_approval_resume_claims');
