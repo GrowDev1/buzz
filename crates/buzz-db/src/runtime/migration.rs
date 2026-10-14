@@ -2048,7 +2048,14 @@ mod postgres_tests {
         let mut expected_fences = migration.fence_attachments.clone();
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
-        expected_fences.extend(["artifact_heads", "artifact_revisions"].map(str::to_owned));
+        expected_fences.extend(
+            [
+                "artifact_heads",
+                "artifact_revisions",
+                "platform_approval_resume_claims",
+            ]
+            .map(str::to_owned),
+        );
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"
