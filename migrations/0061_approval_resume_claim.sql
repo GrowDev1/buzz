@@ -18,7 +18,9 @@ BEGIN
     SELECT * INTO approval FROM workflow_approvals
     WHERE community_id=tenant AND token=approval_token FOR UPDATE;
     IF NOT FOUND OR approval.status <> 'pending' OR approval.expires_at <= clock_timestamp()
-       OR approval.approver_spec <> encode(signer, 'hex') OR octet_length(signer) <> 32 THEN
+       OR NOT (btrim(approval.approver_spec) IN ('', 'any')
+               OR lower(btrim(approval.approver_spec)) = encode(signer, 'hex'))
+       OR octet_length(signer) <> 32 THEN
         RETURN false;
     END IF;
     PERFORM 1 FROM workflow_runs WHERE community_id=tenant AND id=approval.run_id

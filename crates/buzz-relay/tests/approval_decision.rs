@@ -88,7 +88,24 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
     .await
     .unwrap();
     let mut outcomes = Vec::new();
-    for decision in ["grant", "deny", "expired"] {
+    // "any" and upper-case hex specs are accepted by the approver check,
+    // so a signer they admit must be able to grant and to deny.
+    for decision in [
+        "grant",
+        "deny",
+        "expired",
+        "grant-any",
+        "deny-any",
+        "grant-upper",
+        "deny-upper",
+    ] {
+        let spec = if decision.ends_with("-any") {
+            "any".to_owned()
+        } else if decision.ends_with("-upper") {
+            owner.public_key().to_hex().to_uppercase()
+        } else {
+            owner.public_key().to_hex()
+        };
         let (def,definition)=buzz_workflow::WorkflowEngine::parse_yaml(&format!("name: approval\ntrigger:\n  on: message_posted\nsteps:\n  - id: gate\n    action: request_approval\n    from: {}\n    message: confirm\n  - id: after\n    action: send_message\n    text: continued-{decision}\n",owner.public_key().to_hex())).unwrap();
         let wf = db
             .create_workflow(
@@ -126,7 +143,7 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
                 run_id: run,
                 step_id: &def.steps[0].id,
                 step_index: 0,
-                approver_spec: &owner.public_key().to_hex(),
+                approver_spec: &spec,
                 expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             },
             &json!([]),
@@ -153,7 +170,11 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
             .to_owned();
         let make = |keys: &Keys, digest: &str| {
             EventBuilder::new(
-                Kind::Custom(if decision == "deny" { 46031 } else { 46030 }),
+                Kind::Custom(if decision.starts_with("deny") {
+                    46031
+                } else {
+                    46030
+                }),
                 "",
             )
             .tags([
@@ -164,7 +185,13 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
             .sign_with_keys(keys)
             .unwrap()
         };
-        for (keys, d) in [(&wrong, digest.as_str()), (&owner, "wrong-digest")] {
+        // Anyone may decide an "any" approval, so only the digest can refuse it.
+        let refused: Vec<(&Keys, &str)> = if spec == "any" {
+            vec![(&owner, "wrong-digest")]
+        } else {
+            vec![(&wrong, digest.as_str()), (&owner, "wrong-digest")]
+        };
+        for (keys, d) in refused {
             let result = post_event(&client, &url, &host, keys, &make(keys, d)).await;
             assert_ne!(result["accepted"], true, "{result}");
         }
@@ -174,7 +201,7 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
             decision != "expired",
             "{result}"
         );
-        if decision == "grant" {
+        if decision.starts_with("grant") {
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if db.get_workflow_run(tenant, run).await.unwrap().status
@@ -197,7 +224,7 @@ async fn signed_digest_decisions_resume_once_and_survive_restart() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(count, if decision == "grant" { 1 } else { 0 });
+        assert_eq!(count, if decision.starts_with("grant") { 1 } else { 0 });
         outcomes.push((
             run,
             db.get_workflow_run(tenant, run).await.unwrap().status,

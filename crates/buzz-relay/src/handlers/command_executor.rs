@@ -1081,13 +1081,8 @@ async fn decide_approval(
             "invalid: approval token has expired".into(),
         ));
     }
+    // The durable claim and denial repeat this predicate in SQL.
     check_approver_spec(&approval.approver_spec, &hex::encode(signer))?;
-    // The durable claim accepts only the exact designated pubkey.
-    if approval.approver_spec != hex::encode(signer) {
-        return Err(IngestError::Rejected(
-            "forbidden: not the designated approver for this request".into(),
-        ));
-    }
     let mut tx = match persist_command_event(&state.db, tenant, event, None).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {

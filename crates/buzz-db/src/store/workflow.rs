@@ -1485,7 +1485,8 @@ pub async fn deny_approval(
     let changed = sqlx::query(
         "UPDATE workflow_approvals SET status='denied', approver_pubkey=$3, denied_at=now(), note=$4
          WHERE community_id=$1 AND token=$2 AND status='pending' AND expires_at>clock_timestamp()
-           AND approver_spec=encode($3::bytea,'hex')",
+           AND (btrim(approver_spec) IN ('', 'any')
+                OR lower(btrim(approver_spec)) = encode($3::bytea,'hex'))",
     )
     .bind(community_id.as_uuid())
     .bind(token_hash)
